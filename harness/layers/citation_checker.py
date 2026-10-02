@@ -32,11 +32,10 @@ Hai điều kiện loại trừ nhau nên hai lớp không giành điểm của 
     hay vá lại câu bị cắt bằng nội dung lấy từ corpus đều làm mất cả hai
     điều kiện cùng lúc (đo được: -40 điểm).
 
-CHỈ ĐƯỢC GẮN VÀO TÀI LIỆU ĐÃ QUAN SÁT. Trích một tài liệu mà lượt chạy
-chưa từng đọc bị chấm `UNRETRIEVED`. Vì vậy hãy tìm nguồn trong
-`ctx.observed_text`, đừng quét cả corpus rồi gắn bừa: điều kiện
-`doc.body in ctx.observed_text` nghĩa là "tài liệu này đã về nguyên vẹn
-từ một lần fetch sạch" — một đoạn snippet hay một bản bị cắt không tính.
+CHỈ ĐƯỢC GẮN VÀO TÀI LIỆU ĐÃ QUAN SÁT. Search hợp lệ cũng đánh dấu tài
+liệu là retrieved; snippet hoặc fetch bị cắt chỉ dùng được khi chính
+câu trích thực sự xuất hiện trong quan sát và khớp một dòng nguồn.
+Không quét toàn corpus rồi gắn vào tài liệu agent chưa hề nhìn thấy.
 
 CÔNG CỤ CÓ SẴN:
     ctx.observed_text  -> toàn bộ quan sát agent đã thấy, nối lại
@@ -60,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.layers.evidence import observed_sources, supports
 
 
 class CitationChecker(Middleware):
@@ -68,16 +68,29 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        fetched = observed_sources(ctx)
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            doc_id = claim.get("doc_id")
+            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if doc in fetched and supports(text, doc.body):
+                continue
+            source = next(
+                (doc for doc in fetched if supports(text, doc.body)),
+                None,
+            )
+            if source is not None:
+                claim["doc_id"] = source.doc_id
+        report["citations"] = sorted({
+            claim["doc_id"] for claim in claims
+            if isinstance(claim, dict) and isinstance(claim.get("doc_id"), str)
+            and claim["doc_id"]
+        })
+        return report

@@ -70,7 +70,10 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
+from harness.layers.evidence import normalise, observed_sources, supports
 
 
 class Critic(Middleware):
@@ -79,16 +82,38 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            claims = []
+        observed = ctx.observed_text
+        fetched = observed_sources(ctx)
+        kept = []
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if text and normalise(text) in normalise(observed):
+                doc_id = claim.get("doc_id")
+                doc = ctx.corpus.get(doc_id) if ctx.corpus and isinstance(doc_id, str) else None
+                if ctx.corpus is None or (doc in fetched and supports(text, doc.body)):
+                    kept.append(claim)
+                continue
+            for separator in re.finditer(r"\s+(?:và|nhưng|trong khi|còn)\s+", text, re.I):
+                left, right = text[:separator.start()].strip(), text[separator.end():].strip()
+                if min(map(len, (left, right))) < 12:
+                    continue
+                sources = [
+                    next((doc for doc in fetched if supports(part, doc.body)), None)
+                    for part in (left, right)
+                ]
+                if all(sources) and sources[0] != sources[1]:
+                    kept.extend({"text": part, "doc_id": doc.doc_id}
+                                for part, doc in zip((left, right), sources))
+                    report["abstain"] = True
+                    break
+        report["claims"] = kept
+        report["citations"] = sorted({claim["doc_id"] for claim in kept if claim.get("doc_id")})
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ bằng chứng đáng tin cậy để kết luận."
+        return report

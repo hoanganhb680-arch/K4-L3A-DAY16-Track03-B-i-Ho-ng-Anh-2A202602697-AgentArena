@@ -64,8 +64,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import FINALIZE_SENTINEL
-from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
+from arena.model import FINALIZE_SENTINEL, RealModel
+from arena.tools import ToolResult
 
 from harness.middleware import Middleware
 
@@ -75,6 +75,14 @@ DEFAULT_RESERVE = 1
 NUDGE = (
     "Ngân sách công cụ đã hết. Hãy trả lời ngay bằng bằng chứng đang có, "
     f"không gọi thêm công cụ nào nữa. {FINALIZE_SENTINEL}"
+)
+
+REAL_RETRIEVAL_NUDGE = (
+    "Trước khi kết luận hoặc abstain, phải search rồi đọc ít nhất một tài liệu "
+    "bằng fetch_doc. Nếu lượt tìm đầu không có bằng chứng, hãy tìm lại bằng "
+    "thuật ngữ khác liên quan đến câu hỏi. Trích nguyên văn từng dòng của "
+    "nguồn đã thấy; nếu nguồn mâu thuẫn, trình bày cả hai. Với câu hỏi chọn "
+    "phương án, ghi đúng một verdict dựa trên các trích dẫn."
 )
 
 
@@ -87,23 +95,21 @@ class BudgetPolicy(Middleware):
         self.reserve = max(0, int(reserve))
 
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if self._spent(ctx):
+            return messages + [{"role": "user", "content": NUDGE}]
+        model = getattr(ctx, "model", None)
+        if (getattr(ctx, "step", 0) == 0
+                and isinstance(getattr(model, "inner", model), RealModel)
+                and messages and messages[0].get("role") == "system"):
+            return [{**messages[0], "content": messages[0]["content"] + "\n" + REAL_RETRIEVAL_NUDGE},
+                    *messages[1:]]
+        return messages
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if self._spent(ctx):
+            return ToolResult(ok=False, content="", error="tool budget exhausted")
+        return call(name, args)
